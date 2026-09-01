@@ -1,0 +1,6 @@
+.vs/
+artifacts/
+publish/
+*.user
+*.suo
+

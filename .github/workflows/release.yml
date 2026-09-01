@@ -1,0 +1,224 @@
+name: WinUltimak public release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'release-manifest.json'
+      - 'Releases/**'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: winultimak-public-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      # Checkout đúng commit chứa package versioned và không lưu token vào cấu hình Git.
+      - name: Checkout release package
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Xác thực manifest, hash, nội dung ZIP, MIT LICENSE và FileVersion trước khi tạo Release.
+      - name: Validate release package
+        run: |
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'release-manifest.json'
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+              throw 'release-manifest.json is missing.'
+          }
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.schemaVersion -ne 1) {
+              throw "Unsupported release manifest schema: $($manifest.schemaVersion)"
+          }
+
+          $version = [string]$manifest.version
+          if ($version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+              throw "Manifest version is invalid: $version"
+          }
+          $expectedTag = "v$version"
+          if ([string]$manifest.tag -cne $expectedTag) {
+              throw "Manifest tag must equal $expectedTag."
+          }
+          if ($manifest.prerelease -isnot [bool]) {
+              throw 'Manifest prerelease must be a boolean.'
+          }
+
+          $zipFileName = "WinUltimak_v$version.zip"
+          $checksumFileName = "$zipFileName.sha256"
+          $expectedAssetPath = "Releases/$expectedTag/$zipFileName"
+          $expectedChecksumPath = "Releases/$expectedTag/$checksumFileName"
+          if ([string]$manifest.assetPath -cne $expectedAssetPath -or [string]$manifest.checksumPath -cne $expectedChecksumPath) {
+              throw 'Manifest artifact paths do not match the versioned Releases convention.'
+          }
+
+          $assetPath = Join-Path $env:GITHUB_WORKSPACE ($expectedAssetPath -replace '/', '\')
+          $checksumPath = Join-Path $env:GITHUB_WORKSPACE ($expectedChecksumPath -replace '/', '\')
+          if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf) -or -not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
+              throw 'Release ZIP or checksum file is missing.'
+          }
+
+          $actualSize = (Get-Item -LiteralPath $assetPath).Length
+          $expectedSize = [long]$manifest.assetSize
+          if ($expectedSize -le 0 -or $actualSize -ne $expectedSize) {
+              throw "Release ZIP size mismatch. Expected $expectedSize, actual $actualSize."
+          }
+          $expectedHash = ([string]$manifest.assetSha256).ToLowerInvariant()
+          if ($expectedHash -notmatch '^[a-f0-9]{64}$') {
+              throw 'Manifest SHA-256 is invalid.'
+          }
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $assetPath).Hash.ToLowerInvariant()
+          if ($actualHash -cne $expectedHash) {
+              throw 'Release ZIP SHA-256 does not match the manifest.'
+          }
+
+          $checksumText = (Get-Content -LiteralPath $checksumPath -Raw).Trim()
+          if ($checksumText -cne "$expectedHash  $zipFileName") {
+              throw 'Checksum file content does not match the manifest.'
+          }
+
+          Add-Type -AssemblyName System.IO.Compression
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($assetPath)
+          try {
+              $actualEntries = @($archive.Entries | ForEach-Object FullName | Sort-Object)
+              if (Compare-Object -ReferenceObject @('LICENSE', 'WinUltimak.exe') -DifferenceObject $actualEntries) {
+                  throw "Release ZIP has unexpected entries: $($actualEntries -join ', ')"
+              }
+
+              $licenseEntry = $archive.GetEntry('LICENSE')
+              $licenseReader = [System.IO.StreamReader]::new($licenseEntry.Open())
+              try {
+                  $licenseText = $licenseReader.ReadToEnd()
+              }
+              finally {
+                  $licenseReader.Dispose()
+              }
+              if (-not $licenseText.StartsWith('MIT License') -or $licenseText -notmatch 'Copyright \(c\) 2026 Kmaster Kien Nguyen') {
+                  throw 'The packaged LICENSE is not the expected MIT license.'
+              }
+
+              $executableEntry = $archive.GetEntry('WinUltimak.exe')
+              $executablePath = Join-Path $env:RUNNER_TEMP 'WinUltimak-public-candidate.exe'
+              $sourceStream = $executableEntry.Open()
+              $destinationStream = [System.IO.File]::Create($executablePath)
+              try {
+                  $sourceStream.CopyTo($destinationStream)
+              }
+              finally {
+                  $destinationStream.Dispose()
+                  $sourceStream.Dispose()
+              }
+          }
+          finally {
+              $archive.Dispose()
+          }
+
+          $executableVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($executablePath).FileVersion
+          if ($executableVersion -cne $version) {
+              throw "Executable FileVersion '$executableVersion' does not equal '$version'."
+          }
+
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=$expectedTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_PRERELEASE=$($manifest.prerelease.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_ZIP_PATH=$assetPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_CHECKSUM_PATH=$checksumPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_SHA256=$expectedHash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Tạo hoặc phục hồi draft; release đã công khai chỉ được chấp nhận khi asset trùng tuyệt đối.
+      - name: Publish verified public GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $zipFileName = [System.IO.Path]::GetFileName($env:RELEASE_ZIP_PATH)
+          $checksumFileName = [System.IO.Path]::GetFileName($env:RELEASE_CHECKSUM_PATH)
+          $releaseList = gh release list --repo $env:GH_REPO --limit 1000 --json tagName,isDraft,isPrerelease
+          if ($LASTEXITCODE) {
+              throw 'Cannot list existing public GitHub Releases.'
+          }
+          $existingRelease = @($releaseList | ConvertFrom-Json | Where-Object tagName -CEQ $env:RELEASE_TAG) | Select-Object -First 1
+
+          if ($null -ne $existingRelease) {
+              $releaseDetails = gh release view $env:RELEASE_TAG --repo $env:GH_REPO --json assets
+              if ($LASTEXITCODE) {
+                  throw "Cannot inspect existing release $env:RELEASE_TAG."
+              }
+              $assetNames = @((($releaseDetails | ConvertFrom-Json).assets | ForEach-Object name))
+              $unexpectedAssets = @($assetNames | Where-Object { $_ -cne $zipFileName -and $_ -cne $checksumFileName })
+              if ($unexpectedAssets.Count -gt 0) {
+                  throw "Release $env:RELEASE_TAG contains unexpected assets: $($unexpectedAssets -join ', ')"
+              }
+          }
+
+          if ($null -ne $existingRelease -and -not $existingRelease.isDraft) {
+              if ($existingRelease.isPrerelease -ne [System.Convert]::ToBoolean($env:RELEASE_PRERELEASE)) {
+                  throw "Published release $env:RELEASE_TAG has different prerelease metadata."
+              }
+
+              $downloadDirectory = Join-Path $env:RUNNER_TEMP 'existing-public-release'
+              New-Item -ItemType Directory -Path $downloadDirectory -Force | Out-Null
+              gh release download $env:RELEASE_TAG --repo $env:GH_REPO --dir $downloadDirectory --pattern $zipFileName --pattern $checksumFileName
+              if ($LASTEXITCODE) {
+                  throw "Published release $env:RELEASE_TAG does not contain the expected assets."
+              }
+
+              $downloadedHash = (Get-FileHash -LiteralPath (Join-Path $downloadDirectory $zipFileName) -Algorithm SHA256).Hash.ToLowerInvariant()
+              $downloadedChecksum = (Get-Content -LiteralPath (Join-Path $downloadDirectory $checksumFileName) -Raw).Trim()
+              if ($downloadedHash -cne $env:RELEASE_SHA256 -or $downloadedChecksum -cne "$env:RELEASE_SHA256  $zipFileName") {
+                  throw "Published release $env:RELEASE_TAG differs from the committed package. Increase the version."
+              }
+
+              Write-Host "Public release $env:RELEASE_TAG already exists with identical assets."
+              exit 0
+          }
+
+          if ($null -eq $existingRelease) {
+              gh release create $env:RELEASE_TAG --repo $env:GH_REPO --target $env:GITHUB_SHA --draft --title "WinUltimak $env:RELEASE_TAG" --notes 'Verified public binary release.'
+              if ($LASTEXITCODE) {
+                  throw "Cannot create public draft release $env:RELEASE_TAG."
+              }
+          }
+
+          gh release upload $env:RELEASE_TAG $env:RELEASE_ZIP_PATH $env:RELEASE_CHECKSUM_PATH --repo $env:GH_REPO --clobber
+          if ($LASTEXITCODE) {
+              throw "Cannot upload public release assets for $env:RELEASE_TAG."
+          }
+
+          $verifyDirectory = Join-Path $env:RUNNER_TEMP 'verify-public-release'
+          New-Item -ItemType Directory -Path $verifyDirectory -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GH_REPO --dir $verifyDirectory --pattern $zipFileName --pattern $checksumFileName
+          if ($LASTEXITCODE) {
+              throw 'Cannot download public release assets for verification.'
+          }
+
+          $verifiedHash = (Get-FileHash -LiteralPath (Join-Path $verifyDirectory $zipFileName) -Algorithm SHA256).Hash.ToLowerInvariant()
+          $verifiedChecksum = (Get-Content -LiteralPath (Join-Path $verifyDirectory $checksumFileName) -Raw).Trim()
+          if ($verifiedHash -cne $env:RELEASE_SHA256 -or $verifiedChecksum -cne "$env:RELEASE_SHA256  $zipFileName") {
+              throw 'Uploaded public release assets failed verification.'
+          }
+
+          if ([System.Convert]::ToBoolean($env:RELEASE_PRERELEASE)) {
+              gh release edit $env:RELEASE_TAG --repo $env:GH_REPO --draft=false --prerelease=true --latest=false
+          }
+          else {
+              gh release edit $env:RELEASE_TAG --repo $env:GH_REPO --draft=false --prerelease=false --latest=true
+          }
+          if ($LASTEXITCODE) {
+              throw "Cannot publish public release $env:RELEASE_TAG."
+          }
