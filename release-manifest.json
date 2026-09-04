@@ -1,10 +1,10 @@
 {
     "schemaVersion":  1,
-    "version":  "1.0.0.43",
-    "tag":  "v1.0.0.43",
+    "version":  "1.0.0.44",
+    "tag":  "v1.0.0.44",
     "prerelease":  false,
-    "assetPath":  "Releases/v1.0.0.43/WinUltimak_v1.0.0.43.zip",
-    "assetSize":  57866436,
-    "assetSha256":  "69861d42721494e8eade2dc2ad26f811cf8cd2e47b0cc81fd2f719f6080c5ca6",
-    "checksumPath":  "Releases/v1.0.0.43/WinUltimak_v1.0.0.43.zip.sha256"
+    "assetPath":  "Releases/v1.0.0.44/WinUltimak_v1.0.0.44.zip",
+    "assetSize":  58893317,
+    "assetSha256":  "45eba5fa20ea3e54ee554d1c68d8cacb0c312d8d77346669deda37475500472a",
+    "checksumPath":  "Releases/v1.0.0.44/WinUltimak_v1.0.0.44.zip.sha256"
 }
